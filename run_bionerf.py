@@ -7,18 +7,25 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm, trange
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 torch.autograd.set_detect_anomaly(True)
 
 import matplotlib.pyplot as plt
 
 from helpers import *
+from samplers import *
+from teste import *
+from L0_sampler import *
 
 from load_llff import load_llff_data
 from load_blender import load_blender_data
 
 from networks.bionerf import BiologicallyPlausibleNerfModel
+from networks.proposal import ProposalNet
 
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
@@ -32,6 +39,7 @@ psnr_ = PeakSignalNoiseRatio()
 ssim = StructuralSimilarityIndexMeasure()
 lpips = LearnedPerceptualImagePatchSimilarity()
 
+scaler = GradScaler()
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
@@ -314,6 +322,14 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     return rgb_map, disp_map, acc_map, weights, depth_map
 
 
+def compute_alpha_from_density(density, z_vals, eps=1e-10):
+    deltas = z_vals[..., 1:] - z_vals[..., :-1]
+    deltas = torch.cat([deltas, 1e10 * torch.ones_like(deltas[..., :1])], -1)
+    alpha = 1. - torch.exp(-density * deltas)
+    T = torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1. - alpha + eps], -1), -1)[..., :-1]
+    weights = alpha * T
+    return weights
+
 def render_rays(ray_batch,
                 network_fn,
                 network_query_fn,
@@ -388,9 +404,26 @@ def render_rays(ray_batch,
         z_vals = lower + (upper - lower) * t_rand
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
+    
+    # MY CODE FOR UNDERSTANDING
+    # print(f"Z Vals: {z_vals} | Z Vals Shape: {z_vals.shape}")
+    # print(f"PTS: {pts[0]} | PTS Shape: {pts[0].shape}")
+    
+    # points_np = pts[120].cpu().numpy()
+
+    # x, y, z = points_np[:, 0], points_np[:, 1], points_np[:, 2]
+    # fig = plt.figure()
+    # ax = fig.add_subplot(111, projection='3d')
+
+    # ax.scatter(x, y, z, c='b', marker='o')
+    # ax.set_xlabel('X')
+    # ax.set_xlabel('Y')
+    # ax.set_xlabel('Z')
+
+    # plt.show()
 
 
-#     raw = run_network(pts)
+    # Coarse network
     raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
@@ -399,7 +432,36 @@ def render_rays(ray_batch,
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-        z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
+        ti = time.time()
+        z_samples_pdf = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
+        z_samples_L0 = L0_sample_pdf(z_vals[..., 1:-1], weights[...,1:-1], N_importance, spline_type="exp", det=(perturb==0.), blur=True)
+        z_samples_gmm = sample_pdf_gmm(z_vals_mid, weights[...,1:-1], N_importance, K=4, det=(perturb==0.))
+        z_samples_transport = sample_pdf_transport(z_vals_mid, weights[..., 1:-1], N_importance, det=(perturb==0.), pytest=pytest)
+        z_samples_mix = sample_adaptive_kernel_mix_v2(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest, kernel_type="epanechnikov") # Mais rapido ate agora
+
+        z_samples_mixv3, N_samples_per_ray, skip_mask = sample_adaptive_kernel_mix_v3(z_vals_mid, weights[..., 1:-1], N_samples_max=N_importance, N_samples_min=N_importance//4, det=(perturb==0.), kernel_type="uniform", uncertainty_threshold=0.01)
+        if skip_mask.any():
+            N_rays, N_samples_actual = z_samples_mixv3.shape
+            skip_mask_expanded = skip_mask.unsqueeze(1).expand(-1, N_samples_actual)
+            fallback_vals = z_vals_mid.mean(dim=-1, keepdim=True)
+            z_samples_mixv3 = torch.where(skip_mask_expanded, fallback_vals.expand_as(z_samples_mixv3), z_samples_mixv3)
+
+        samples_dict = {"Sample_pdf": z_samples_pdf,
+                        "L0": z_samples_L0,
+                        "GMM": z_samples_gmm,
+                        "Transport": z_samples_transport,
+                        "Kernel Mix v2": z_samples_mix,
+                        "kernel Mix v3": z_samples_mixv3
+                        }
+
+
+        # visualize_sampler_dict(z_vals_mid, weights[..., :-1], samples_dict, ray_idx=0)
+        # visualize_all_pdfs(z_vals_mid, weights[..., :-1], samples_dict, ray_idx=0)
+        plot_coarse_pdf_and_strip(z_vals_mid, weights[..., :-1], samples_dict, ray_idx=0)
+
+        z_samples = z_samples_mix
+        tf = time.time()
+        # print(f"Sampling Time: {tf-ti}")
         z_samples = z_samples.detach()
 
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
@@ -733,7 +795,7 @@ def train():
 
     
     start = start + 1
-    for i in trange(start, N_iters):
+    for i in trange(start, 50001):
         time0 = time.time()
 
         # Sample random ray batch
@@ -782,24 +844,28 @@ def train():
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
-        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+        
+        with autocast():
+            rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
 
+            
+            img_loss = img2mse(rgb, target_s)
+            trans = extras['raw'][...,-1]
+            loss = img_loss
+            psnr = mse2psnr(img_loss)
+
+
+            if 'rgb0' in extras:
+                img_loss0 = img2mse(extras['rgb0'], target_s)
+                loss = loss + img_loss0
+                psnr0 = mse2psnr(img_loss0)
+
         optimizer.zero_grad()
-        img_loss = img2mse(rgb, target_s)
-        trans = extras['raw'][...,-1]
-        loss = img_loss
-        psnr = mse2psnr(img_loss)
-
-
-        if 'rgb0' in extras:
-            img_loss0 = img2mse(extras['rgb0'], target_s)
-            loss = loss + img_loss0
-            psnr0 = mse2psnr(img_loss0)
-
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
